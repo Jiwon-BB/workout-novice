@@ -1,5 +1,5 @@
 // 자동 생성 — build-site.py. 직접 고치지 말 것.
-const CACHE = 'workout-20260901-0109';
+const CACHE = 'workout-20260901-0114';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
