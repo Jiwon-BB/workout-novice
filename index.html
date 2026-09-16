@@ -164,26 +164,46 @@ function beep() {
   oscillator.stop(audioContext.currentTime + 0.5);
 }
 
-function createRestTimer({ onTick, onFinish }) {
+function createRestTimer({ onTick, onFinish, onWakeLockChange }) {
   let startedAt = null;
   let durationMs = 0;
   let repaintId = null;
   let wakeLock = null;
   let finished = false;
+  // 'idle' | 'unsupported' | 'pending' | 'active' | 'failed'
+  //
+  // hasWakeLock()만으로는 화면에 사실을 쓸 수 없다. start()가 acquireWakeLock()을
+  // await하지 않으므로(그러면 타이머 시작이 권한 응답만큼 늦어진다) 렌더 시점에는
+  // 아직 null이고, 실제로 잠금을 얻어도 "쓸 수 없습니다"가 떠 버린다.
+  // 그래서 '아직 모름(pending)'과 '못 씀(unsupported/failed)'을 구분한다.
+  let lockState = 'idle';
 
   function remainingMs() {
     if (startedAt === null) return 0;
     return Math.max(0, durationMs - (Date.now() - startedAt));
   }
 
+  function setLockState(next) {
+    if (lockState === next) return;
+    lockState = next;
+    onWakeLockChange?.(next);
+  }
+
   async function acquireWakeLock() {
     // Wake Lock은 secure context(https / localhost)에서만 존재한다.
     // 실패해도 조용히 넘어간다 — 타이머 자체는 타임스탬프 기반이라 영향받지 않는다.
-    if (!('wakeLock' in navigator)) return;
+    // 다만 '못 쓴다'와 '아직 응답이 안 왔다'는 화면에 다르게 적어야 한다.
+    if (!('wakeLock' in navigator)) {
+      setLockState('unsupported');
+      return;
+    }
+    setLockState('pending');
     try {
       wakeLock = await navigator.wakeLock.request('screen');
+      setLockState('active');
     } catch {
       wakeLock = null;
+      setLockState('failed');
     }
   }
 
@@ -230,10 +250,13 @@ function createRestTimer({ onTick, onFinish }) {
       startedAt = null;
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       releaseWakeLock();
+      setLockState('idle');
     },
     remainingMs,
     isRunning: () => startedAt !== null,
     hasWakeLock: () => wakeLock !== null,
+    // 화면 문구용. hasWakeLock()은 '아직 모름'과 '못 씀'을 구분하지 못한다.
+    wakeLockState: () => lockState,
   };
 }
 
@@ -263,24 +286,62 @@ function formatRemaining(milliseconds) {
 const RIR_ERROR_MODEL = {
   highTrustMaxReps: 8,          // reps <= 8 이거나 부하 >= 75% 1RM → 보정 0
   mediumTrustMaxReps: 15,       // reps 9-15 → +1
-  rampExtraOffset: 1,           // 램프 기간에는 추가 +1 (근거표 rir_report_bias)
+  // 램프·초보는 추가 +1. 출처는 returner_protocol.rir_correction_for_returners —
+  // "Assume returner's self-reported RIR is 1-2 REPS OPTIMISTIC first weeks
+  //  (PMID 28301439: novices under-rate maximal effort)".
+  // 이전 주석은 근거표의 'rir_report_bias'를 인용했는데 그런 키는 존재하지 않는다.
+  rampExtraOffset: 1,
 };
 
 /**
+ * 근거표에서 RIR 오차 모델을 뽑는다. 위 RIR_ERROR_MODEL은 이 함수가 못 도는 환경
+ * (evidence 없이 순수 호출)을 위한 기본값일 뿐, 진짜 출처는 JSON이다.
+ *
+ * 주의 — 임계값이 값이 아니라 **키 이름**에 들어 있다:
+ *   "reps_le_8_or_load_ge_75pct" / "reps_9_to_15" / "reps_gt_15"
+ * 그래서 키를 정규식으로 파싱한다. 문서 구조가 바뀌면 조용히 틀린 값을 쓰는 대신
+ * throw 한다 — progression은 부하를 결정하므로 조용한 실패가 가장 나쁘다.
+ *
+ * @returns {{ highTrustMaxReps, mediumTrustMaxReps, rampExtraOffset, offsets, trust }}
+ */
+function rirErrorModelFromEvidence(evidence) {
+  const model = evidence?.parameters?.find?.((p) => p.id === 'rir_self_report_validity')?.error_model;
+  if (!model) throw new Error('근거표에서 rir_self_report_validity.error_model을 찾지 못했다.');
+
+  const keys = Object.keys(model);
+  const highKey = keys.find((k) => /^reps_le_(\d+)/.test(k));
+  const midKey = keys.find((k) => /^reps_(\d+)_to_(\d+)$/.test(k));
+  const highMax = highKey && Number(highKey.match(/^reps_le_(\d+)/)[1]);
+  const midMax = midKey && Number(midKey.match(/^reps_(\d+)_to_(\d+)$/)[2]);
+  if (!highMax || !midMax) {
+    throw new Error(`error_model 키 형식이 예상과 다르다: ${keys.join(', ')}`);
+  }
+
+  return {
+    highTrustMaxReps: highMax,
+    mediumTrustMaxReps: midMax,
+    // 램프·초보 추가 보정은 error_model이 아니라 returner_protocol에 있다.
+    rampExtraOffset: 1,
+    offsets: { high: model[highKey].assume_offset, medium: model[midKey].assume_offset },
+  };
+}
+
+/**
  * 보고된 RIR → 추정 실제 RIR.
+ * @param options.model 근거표에서 뽑은 오차 모델. 없으면 RIR_ERROR_MODEL 기본값을 쓴다.
  * @returns {{ rir: number|null, trust: 'high'|'medium'|'none', offset: number }}
  *          trust==='none'이면 이 세트의 RIR을 제어 변수로 쓰지 않는다.
  */
-function correctRir(reportedRir, reps, { isRamp = false } = {}) {
+function correctRir(reportedRir, reps, { isRamp = false, model = RIR_ERROR_MODEL } = {}) {
   if (reportedRir === null || reportedRir === undefined) {
     return { rir: null, trust: 'none', offset: 0 };
   }
-  if (reps > RIR_ERROR_MODEL.mediumTrustMaxReps) {
+  if (reps > model.mediumTrustMaxReps) {
     // 관측 오차 ~5.15회. 이 크기의 오차는 보정할 수 있는 것이 아니라 배제해야 하는 것이다.
     return { rir: null, trust: 'none', offset: 0 };
   }
-  const base = reps <= RIR_ERROR_MODEL.highTrustMaxReps ? 0 : 1;
-  const offset = base + (isRamp ? RIR_ERROR_MODEL.rampExtraOffset : 0);
+  const base = reps <= model.highTrustMaxReps ? 0 : 1;
+  const offset = base + (isRamp ? model.rampExtraOffset : 0);
   return { rir: reportedRir + offset, trust: base === 0 ? 'high' : 'medium', offset };
 }
 
@@ -300,6 +361,18 @@ const E1RM_NOISE_FLOOR_PCT = 3.27;
 // 부하 증가폭. 근거표는 +2-10%를 말한다. 장비 해상도가 그 구간을 넘으면 부하 대신 반복으로 간다
 // (parameters.progression: "choose by EQUIPMENT GRANULARITY").
 const LOAD_INCREMENT_PCT = { min: 2, max: 10 };
+
+// ── 아래 세 값은 근거표에서 뽑을 수 없다. 구분해서 적어 둔다. ────────────────
+//
+// LOAD_INCREMENT_PCT (2-10%)
+//   parameters.progression.engine_rule의 영문 산문 안에만 있다("Default increment:
+//   +2-10% load..."). 기계 판독 가능한 필드가 아니라 코드로 옮겨 적을 수밖에 없다.
+//   근거표가 갱신돼도 이 값은 자동으로 따라오지 않는다.
+//
+// FAILED_SESSIONS_BEFORE_BACKOFF (2세션) / BACKOFF_PCT (5%)
+//   **근거표에 대응 항목이 아예 없다.** 문헌에서 유도한 값이 아니라 엔진이 정한
+//   관행값이다. "한 세션 부진은 노이즈"라는 판단만 deload_detection.engine_rule의
+//   취지와 같은 방향일 뿐, 2세션·5%라는 숫자를 검증한 항목은 없다.
 const FAILED_SESSIONS_BEFORE_BACKOFF = 2;
 const BACKOFF_PCT = 5;
 
@@ -404,7 +477,12 @@ function roundTo(value, increment) {
 // ── deload 신호 (반응형만) ──────────────────────────────────────────────────
 // 달력 기반 자동 deload는 만들지 않는다. 직접 RCT 2편 모두 근비대에 null이고 하나는 근력에 음성이다
 // (parameters.deload.verdict). 아래는 "제안"이지 자동 실행이 아니다.
-const DELOAD_DROP_PCT = 10;          // deload_detection: >10% over >=2-3 sessions
+// 이 두 값도 근거표에서 뽑을 수 없다. deload_detection.engine_rule의 영문 산문에
+// "suggest >10% over >=2-3 sessions"로만 있고 기계 판독 가능한 필드가 아니다.
+// 게다가 deload_detection의 certainty는 **low**이고, 근거표가 제시하는 noise_floor는
+// CMJ/IMTP(점프·등척성 당김)의 것이지 e1RM의 것이 아니다 — 여기서는 e1RM에 적용하고
+// 있으므로 임계값의 근거가 그대로 옮겨오지 않는다. 그래서 자동 실행이 아니라 '제안'이다.
+const DELOAD_DROP_PCT = 10;
 const DELOAD_MIN_SESSIONS = 2;
 
 /**
@@ -1933,6 +2011,13 @@ async function expandPrescribedSets(template, warmupProtocol = null, options = {
   const musclesWorked = new Set();
   const skipMatch = warmupProtocol?.skip_when_muscle_already_worked?.match;
 
+  // RIR 오차 모델을 근거표에서 뽑는다. evidence가 안 넘어오면 progression.js의 기본값을 쓴다
+  // (지금은 두 값이 같다 — 자가점검이 그것을 확인한다).
+  //
+  // 여기서 throw를 잡지 않는 것은 의도다. 근거표 구조가 깨졌다면 조용히 기본값으로 돌아가
+  // 잘못된 부하를 처방하는 것보다, 화면에 오류를 띄우고 멈추는 편이 낫다.
+  const rirModel = options.evidence ? rirErrorModelFromEvidence(options.evidence) : undefined;
+
   for (const item of items) {
     const exercise = await getExercise(item.exercise_id);
     if (!exercise) throw new Error(`종목 '${item.exercise_id}'이(가) exercises 스토어에 없다.`);
@@ -1950,7 +2035,11 @@ async function expandPrescribedSets(template, warmupProtocol = null, options = {
         },
         // 초보자는 최대 노력을 과소평가한다(PMID 28301439). 램프와 같은 +1 보정을 적용한다.
         // 램프 주차에는 is_ramp만으로 이미 참이라 보정 설정과 무관하게 동일하게 동작한다.
-        { isRamp: template.is_ramp === true || noviceCorrection(template, options) });
+        //
+        // nextPrescription은 이 객체를 correctRir에 그대로 넘긴다(progression.js:143).
+        // 그래서 model을 여기 얹으면 근거표에서 뽑은 오차 모델이 그대로 흐른다.
+        // rirModel이 undefined면 correctRir의 기본값(RIR_ERROR_MODEL)이 쓰인다.
+        { isRamp: template.is_ramp === true || noviceCorrection(template, options), model: rirModel });
     }
 
     const fallbackWeight = item.prescribed_weight === null
@@ -2266,7 +2355,7 @@ const RIR_CHOICES = [0, 1, 2, 3, 4, 5, 6];
 
 // 번들 빌드 시각. build-artifact.py가 게시 시점 값으로 치환한다.
 // 로컬에서 직접 열면 'dev'로 남는다.
-const BUILD_STAMP = '09-16 08:23 UTC';
+const BUILD_STAMP = '09-16 08:50 UTC';
 
 const app = document.getElementById('app');
 const state = {
@@ -2284,6 +2373,14 @@ const state = {
   remainingMs: 0, error: null,
 };
 
+// Wake Lock 상태별 문구. 요점은 '아직 응답이 안 왔다'를 '못 쓴다'로 적지 않는 것이다.
+function wakeLockNote(lockState) {
+  if (lockState === 'active') return '타이머가 도는 동안 화면을 켜 둡니다.';
+  if (lockState === 'unsupported') return '이 환경에서는 화면 켜두기(Wake Lock)를 쓸 수 없습니다.';
+  if (lockState === 'failed') return '화면 켜두기가 거부됐습니다 — 화면이 꺼질 수 있습니다.';
+  return '화면 켜두기를 요청하는 중입니다…';
+}
+
 const timer = createRestTimer({
   onTick: (remaining) => {
     state.remainingMs = remaining;
@@ -2291,6 +2388,12 @@ const timer = createRestTimer({
     if (element) element.textContent = formatRemaining(remaining);
   },
   onFinish: () => { if (state.phase === 'rest') goToCurrentSet(); },
+  // Wake Lock 응답은 start() 이후에 도착한다. 쉬는시간 화면은 그동안 다시 그려지지 않으므로
+  // (onTick도 #remaining만 갈아끼운다) 이 문구도 같은 방식으로 직접 갈아끼운다.
+  onWakeLockChange: (lockState) => {
+    const element = document.getElementById('wakelock-note');
+    if (element) element.textContent = wakeLockNote(lockState);
+  },
 });
 
 const escapeHtml = (text) => String(text).replace(/[&<>"]/g, (character) =>
@@ -2735,7 +2838,7 @@ function renderRest() {
 
     <div class="warn">화면을 끄면 알림이 오지 않습니다. iOS 웹앱에는 로컬 알림 기능이 없습니다.
       남은 시간 자체는 시계로 계산하므로 화면을 껐다 켜도 정확합니다.
-      ${timer.hasWakeLock() ? '타이머가 도는 동안 화면을 켜 둡니다.' : '이 환경에서는 화면 켜두기(Wake Lock)를 쓸 수 없습니다.'}</div>`;
+      <span id="wakelock-note">${wakeLockNote(timer.wakeLockState())}</span></div>`;
 }
 
 function renderSkipMenu() {
@@ -2836,7 +2939,7 @@ app.addEventListener('click', async (event) => {
   if (action === 'pick') {
     state.template = state.templates.find((item) => item.id === template);
     state.prescribedSets = await expandPrescribedSets(state.template, state.warmupProtocol,
-      { noviceRirCorrection: state.noviceRirCorrection });
+      { noviceRirCorrection: state.noviceRirCorrection, evidence: state.evidence });
     state.phase = 'intro';
     render();
 
@@ -2927,7 +3030,7 @@ app.addEventListener('click', async (event) => {
     await setMeta('novice_rir_correction', state.noviceRirCorrection);
     if (state.template) {
       state.prescribedSets = await expandPrescribedSets(state.template, state.warmupProtocol,
-        { noviceRirCorrection: state.noviceRirCorrection });
+        { noviceRirCorrection: state.noviceRirCorrection, evidence: state.evidence });
     }
     render();
 
@@ -3120,7 +3223,7 @@ try {
   } else {
     state.template = resumedTemplate;
     state.prescribedSets = await expandPrescribedSets(state.template, state.warmupProtocol,
-      { noviceRirCorrection: state.noviceRirCorrection });
+      { noviceRirCorrection: state.noviceRirCorrection, evidence: state.evidence });
 
     if (resumed.needsResumeDecision) { state.phase = 'resume_prompt'; render(); }
     else if (resumed.recorded.length > 0) goToCurrentSet();
