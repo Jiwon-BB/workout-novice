@@ -2266,7 +2266,7 @@ const RIR_CHOICES = [0, 1, 2, 3, 4, 5, 6];
 
 // 번들 빌드 시각. build-artifact.py가 게시 시점 값으로 치환한다.
 // 로컬에서 직접 열면 'dev'로 남는다.
-const BUILD_STAMP = '09-15 11:25 UTC';
+const BUILD_STAMP = '09-16 08:23 UTC';
 
 const app = document.getElementById('app');
 const state = {
@@ -2549,15 +2549,18 @@ function renderBackup() {
 
 function renderIntro() {
   const returner = state.evidence.returner_protocol;
-  const week1 = returner.ramp_schedule.week_1;
+  // 고른 주차의 값을 쓴다. 예전에는 ramp_schedule.week_1을 고정으로 읽어서 W2·W3에서도
+  // W1의 33% / 12-15회 / RIR 4-5가 떴다 — 세트 화면은 맞는데 이 화면만 틀렸다.
+  // renderPick(:172)·buildDashboard(:633)와 같은 방식으로 state.rampPlan에서 찾는다.
+  const plan = state.rampPlan.find((entry) => entry.week === state.week) ?? state.rampPlan[0];
 
   return `
     <div class="topbar"><h1>${escapeHtml(state.template.name)}</h1>
       <span class="muted">${state.template.items.length}종목 · 총 ${state.prescribedSets.length}세트</span></div>
     <p>작업 세트 ${state.prescribedSets.filter((set) => !set.is_warmup).length}개 ·
        워밍업 ${state.prescribedSets.filter((set) => set.is_warmup).length}개</p>
-    <p>목표 볼륨의 <strong>${week1.volume_pct_of_target}%</strong> · ${escapeHtml(week1.rep_range)} ·
-       RIR ${week1.rir.join('–')}</p>
+    <p><strong>${escapeHtml(plan.label)}</strong> — 목표 볼륨의 <strong>${plan.volume_pct_of_target}%</strong> ·
+       ${escapeHtml(plan.reps)}회 · RIR ${escapeHtml(plan.rir)}</p>
     <button class="primary" data-action="start">세션 시작</button>
     <button class="secondary" data-action="skip-session-menu">오늘 건너뜀</button>
     <button class="secondary" data-action="back-to-pick">다른 세션 고르기</button>
@@ -2719,9 +2722,13 @@ function renderRest() {
         <div class="label">${isNewExercise ? '다음 운동' : next.is_warmup ? '다음 — 워밍업' : '다음 — 본세트'}</div>
         <p class="exercise" style="font-size:1.25rem">${escapeHtml(next.exercise.name_en)}</p>
         <p class="muted">${next.set_index}세트 / ${next.total_sets} ·
-           ${next.bodyweight ? '맨몸' : `${next.prescribed_weight ?? state.weight ?? '?'} kg`}
-           × ${next.prescribed_rep_low}–${next.prescribed_rep_high} ·
-           RIR ${next.prescribed_rir_low}–${next.prescribed_rir_high}</p>
+           ${next.bodyweight ? '맨몸' : `${next.default_weight ?? next.prescribed_weight ?? '?'} kg`}
+           × ${next.prescribed_rep_low}–${next.prescribed_rep_high}${
+             // 워밍업은 RIR 목표가 없다(session.js에서 null로 둔다). 가드가 없으면
+             // 'RIR null–null'이 그대로 찍힌다 — renderSet에는 있는 가드가 여기만 빠져 있었다.
+             next.prescribed_rir_low === null || next.prescribed_rir_high === null
+               ? ''
+               : ` · RIR ${next.prescribed_rir_low}–${next.prescribed_rir_high}`}</p>
       </div>` : '<p>마지막 세트였습니다.</p>'}
 
     <button class="primary" data-action="next-set">건너뛰고 다음 세트</button>
